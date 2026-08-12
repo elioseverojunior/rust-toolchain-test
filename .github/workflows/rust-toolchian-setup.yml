@@ -1,0 +1,304 @@
+# Builds and verifies the crate this repository actually ships.
+#
+# Its counterpart, rust-toolchian-on-demand-setup.yml, is the cache harness: a
+# seed job that installs a tool and plants markers, and a warm job that proves
+# those markers round-tripped through the archive. That workflow asserts things
+# about the ACTION. This one asserts things about the CODE.
+#
+# The split matters because the harness only works as a pair. Its warm job
+# restores what its seed job saved, greps for TOOL_MARKER_FROM_SEED, and reads
+# act-probe/target — none of which exist unless the seed job ran first, in the
+# same workflow, immediately before. Lifting the warm job out on its own leaves
+# assertions that cannot pass no matter how healthy the action is.
+
+name: Rust Toolchain Setup
+
+# Controls when the workflow will run
+on:
+  # Triggers the workflow on push or pull request events but only for the "main" branch
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build The Cargo Project
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: "recursive"
+
+      # No rust-toolchain.toml is written here, unlike in the harness workflow,
+      # which overwrites it to keep its two jobs deriving byte-identical cache
+      # keys. The committed one -- channel 1.97, four targets, rustfmt, clippy,
+      # llvm-tools, rust-src -- is the configuration this repository actually
+      # declares, and building against a trimmed-down substitute would verify a
+      # toolchain nobody uses.
+      - name: Install The Toolchain And Restore The Cache
+        id: rust-toolchain
+        uses: elioseverojunior/rust-toolchain@v0
+        with:
+          cache: true
+          # `hashFiles()` is a workflow-expression function, so the action
+          # cannot compute this itself and rejects an empty value rather than
+          # deriving a key that would hit forever. The committed Cargo.lock is
+          # the right input: it changes exactly when the dependency graph does,
+          # which is exactly when the registry and build layers must be
+          # re-keyed.
+          cache-key-hash: ${{ hashFiles('Cargo.lock') }}
+          # Deliberately NOT `act-cache`, the suffix the harness workflow uses.
+          # GitHub's cache is repository-scoped, not workflow-scoped, so a
+          # shared suffix would let two unrelated workflows write over each
+          # other's entries and make either one's result depend on the other's
+          # timing.
+          cache-key-suffix: project
+          # `cache-workspaces` is omitted on purpose: it defaults to
+          # `. -> target`, which is already the real crate at the repository
+          # root. The harness needs the explicit `act-probe -> act-probe/target`
+          # mapping only because its probe crate lives in a subdirectory.
+          msrv-check: error
+
+      - name: Report The Resolved Toolchain
+        shell: bash
+        env:
+          RESOLVED: ${{ steps.rust-toolchain.outputs.toolchain }}
+          CACHE_HIT: ${{ steps.rust-toolchain.outputs.cache-hit }}
+          CACHE_JSON: ${{ steps.rust-toolchain.outputs.cache }}
+        run: |
+          set -eo pipefail
+
+          # After the action, never before. The action exports RUSTUP_TOOLCHAIN,
+          # so running `rustup show` first would report whatever the runner
+          # image happened to ship and would trigger an install of the committed
+          # channel outside the action's control.
+          rustup show
+          rustc --version
+          cargo --version
+
+          echo "resolved toolchain: $RESOLVED"
+          echo "cache-hit:          $CACHE_HIT"
+          echo "cache:              $CACHE_JSON"
+
+      # `msrv-check: error` above already fails the job when the resolved graph
+      # needs a NEWER compiler than the one installed. These assertions cover
+      # the other half: that the check read the value from where we think, and
+      # found the number we think. A check silently falling back to a different
+      # source would otherwise pass while testing nothing.
+      - name: Verify The MSRV Was Read From Cargo.toml
+        shell: bash
+        env:
+          MSRV: ${{ steps.rust-toolchain.outputs.msrv }}
+          MSRV_EFFECTIVE: ${{ steps.rust-toolchain.outputs.msrv-effective }}
+          MSRV_SOURCE: ${{ steps.rust-toolchain.outputs.msrv-source }}
+        run: |
+          set -eo pipefail
+
+          echo "msrv:           $MSRV"
+          echo "msrv-effective: $MSRV_EFFECTIVE"
+          echo "msrv-source:    $MSRV_SOURCE"
+
+          # Read the floor straight out of the manifest rather than comparing
+          # the action's output against itself. grep is the INDEPENDENT source:
+          # the action parsed Cargo.toml its own way, this parses it another,
+          # and the assertion is that the two agree -- which is exactly what
+          # this step is named for. No version literal lives in this workflow,
+          # so raising rust-version needs no edit here.
+          declared="$(grep -m1 -E '^rust-version[[:space:]]*=' Cargo.toml | cut -d'"' -f2)"
+          echo "declared:       $declared"
+
+          if [[ -z "$declared" ]]; then
+            echo "::error::the root Cargo.toml declares no rust-version, so there is no floor to verify"
+            exit 1
+          fi
+          if [[ "$MSRV" != "$declared" ]]; then
+            echo "::error::msrv is '$MSRV' but the root Cargo.toml declares '$declared'"
+            exit 1
+          fi
+          if [[ "$MSRV_SOURCE" != "cargo-toml" ]]; then
+            echo "::error::msrv-source is '$MSRV_SOURCE', expected 'cargo-toml'"
+            exit 1
+          fi
+          # Asserted non-empty rather than to an exact value: this is the
+          # highest rust-version across the RESOLVED GRAPH, so a dependency
+          # raising its own floor upstream would move it. The point is that the
+          # check ran against a real graph, not that it found a fixed number.
+          if [[ -z "$MSRV_EFFECTIVE" ]]; then
+            echo "::error::msrv-effective is empty; the check against the real graph did not run"
+            exit 1
+          fi
+
+      # Formatting first, and without --locked: it never resolves a graph, and
+      # a failure here is the cheapest possible signal.
+      - name: Check Formatting
+        shell: bash
+        run: |
+          set -eo pipefail
+
+          cargo fmt --all -- --check
+
+      # --locked everywhere below. It pins the build to the committed lockfile,
+      # which is what a consumer actually gets, and turns a stale lockfile into
+      # a hard failure instead of a silent re-resolve that quietly tests a
+      # different dependency set than the one in the repository.
+      - name: Lint
+        shell: bash
+        run: |
+          set -eo pipefail
+
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Build
+        shell: bash
+        run: |
+          set -eo pipefail
+
+          cargo build --locked --all-targets
+
+      - name: Test
+        shell: bash
+        run: |
+          set -eo pipefail
+
+          cargo test --locked --all-features
+
+  # The job that keeps the declared `rust-version` honest.
+  #
+  # Everything above compiles on the channel rust-toolchain.toml pins, which is
+  # many releases newer than the floor -- every API stabilised in between works
+  # there. So the declared floor can rot indefinitely with the build job fully
+  # green, and the first person to find out is a consumer on the floor whose
+  # build breaks.
+  #
+  # No `needs:`, no inputs, no version literal. The floor is discovered from
+  # Cargo.toml by the action itself, so this job shares no state with the build
+  # above: it still reports when that job fails, and vice versa.
+  msrv:
+    name: Verify The Declared MSRV Floor
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: "recursive"
+
+      - name: Prepare Isolated Rustup Home
+        shell: bash
+        run: |
+          # Installs the floor toolchain into a scratch RUSTUP_HOME instead of
+          # mutating the one the runner image ships. The harness workflow needs
+          # this because `act` runs on overlayfs, where a rename cannot cross
+          # from a lower image layer to the upper one and the install fails with
+          # EXDEV; here the reason is narrower but still real -- a second,
+          # deliberately-old toolchain has no business being grafted into the
+          # image's rustup home, and a partial install cannot leave it damaged.
+          rustup_home="${RUNNER_TEMP:-/tmp}/rustup"
+          mkdir -p "$rustup_home"
+          echo "RUSTUP_HOME=$rustup_home" >> "$GITHUB_ENV"
+
+      # `msrv-fallback` derives the toolchain from Cargo.toml's rust-version,
+      # but only "when neither the `toolchain` input nor `rust-toolchain.toml`
+      # names a channel". The committed toml names 1.97, so it has to go for
+      # the fallback to engage -- and removing it is the honest expression of
+      # what this job is: the channel pin says what the project BUILDS with,
+      # and this job deliberately ignores that to test what it PROMISES.
+      #
+      # Deleting rather than rewriting: an overwritten toml would just be
+      # another place a version number lives, which is the thing being removed.
+      - name: Remove The Channel Pin So The Floor Can Be Discovered
+        shell: bash
+        run: |
+          set -eo pipefail
+
+          rm -f rust-toolchain.toml
+          echo "removed the channel pin; the floor now comes from Cargo.toml"
+
+      # No `toolchain:` input, and no version anywhere in this file. The action
+      # reads rust-version out of Cargo.toml itself, which makes the manifest
+      # the single source of truth: raising the floor there moves this job with
+      # no edit here, and there is no second copy left to drift.
+      #
+      # This is also the only place in the repository that exercises
+      # `msrv-fallback` at all -- fitting, for a repository whose purpose is
+      # validating the action.
+      #
+      # `msrv-check: error` still binds, and it is what catches the case
+      # `msrv-fallback` cannot: the fallback installs the crate's OWN declared
+      # floor, while the check compares against the highest rust-version in the
+      # resolved GRAPH. A dependency needing more than the crate promises fails
+      # here, which is exactly right -- that combination means the declared
+      # floor is a lie.
+      #
+      # cache: false is deliberate. This job installs a second toolchain and
+      # would otherwise write a `build` layer keyed on it, doubling the cache
+      # footprint to store artifacts nothing ever restores. Dropping the toml
+      # also drops its four targets and llvm-tools/rust-src from the install,
+      # so this job is now minutes faster than it was.
+      - name: Install The Floor Toolchain
+        id: rust-toolchain
+        uses: elioseverojunior/rust-toolchain@v0
+        with:
+          msrv-fallback: true
+          cache: false
+          msrv-check: error
+
+      - name: Verify The Installed Toolchain Is The Floor
+        shell: bash
+        env:
+          RESOLVED: ${{ steps.rust-toolchain.outputs.toolchain }}
+          MSRV: ${{ steps.rust-toolchain.outputs.msrv }}
+          MSRV_EFFECTIVE: ${{ steps.rust-toolchain.outputs.msrv-effective }}
+          MSRV_SOURCE: ${{ steps.rust-toolchain.outputs.msrv-source }}
+        run: |
+          set -eo pipefail
+
+          rustc --version
+          echo "resolved toolchain: $RESOLVED"
+          echo "declared msrv:      $MSRV"
+          echo "effective msrv:     $MSRV_EFFECTIVE"
+          echo "msrv-source:        $MSRV_SOURCE"
+
+          # An empty msrv means the fallback had nothing to derive from, so the
+          # action would have installed rustup's default instead and everything
+          # below would be measuring the wrong compiler.
+          if [[ -z "$MSRV" ]]; then
+            echo "::error::the action read no rust-version from Cargo.toml, so msrv-fallback had nothing to install"
+            exit 1
+          fi
+
+          # THE assertion. It is not circular: `$MSRV` is what the action READ
+          # from the manifest, and `rustc --version` is what actually got
+          # INSTALLED. This proves the fallback did its job -- if it had
+          # regressed, or the removed toml had somehow still won, this reads a
+          # different series and fails.
+          #
+          # Series prefix rather than an exact string: a `1.88` pin resolves to
+          # the newest patch in that series.
+          if [[ "$(rustc --version)" != *" $MSRV."* ]]; then
+            echo "::error::rustc is not on the $MSRV series; msrv-fallback did not install the declared floor, so this job proves nothing"
+            exit 1
+          fi
+
+      # `check`, not `build`: type and borrow checking is where a
+      # too-new-API-for-the-floor mistake surfaces, and codegen adds minutes
+      # without adding coverage. --all-targets so tests, benches and examples
+      # are held to the floor too, not just the binary.
+      #
+      # No clippy here. Its lints change between releases, so a 1.88 run would
+      # fail on lints the 1.97 build job never sees -- noise about the linter,
+      # not signal about the floor.
+      - name: Check The Real Crate At The Floor
+        shell: bash
+        run: |
+          set -eo pipefail
+
+          cargo check --locked --all-targets
