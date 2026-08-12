@@ -30,7 +30,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       msrv: ${{ steps.rust-toolchain.outputs.msrv }}
-      msrv-source: ${{ steps.rust-toolchain.outputs.msrv-source }}      
+      msrv-source: ${{ steps.rust-toolchain.outputs.msrv-source }}
+      msrv-effective: ${{ steps.rust-toolchain.outputs.msrv-effective }}
+      toolchain: ${{ steps.rust-toolchain.outputs.toolchain }}
 
     steps:
       - name: Checkout
