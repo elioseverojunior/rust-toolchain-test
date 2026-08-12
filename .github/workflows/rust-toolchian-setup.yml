@@ -28,6 +28,9 @@ jobs:
   build:
     name: Build The Cargo Project
     runs-on: ubuntu-latest
+    outputs:
+      msrv: ${{ steps.rust-toolchain.outputs.msrv }}
+      msrv-source: ${{ steps.rust-toolchain.outputs.msrv-source }}      
 
     steps:
       - name: Checkout
@@ -47,12 +50,11 @@ jobs:
         uses: elioseverojunior/rust-toolchain@v0
         with:
           cache: true
-          # `hashFiles()` is a workflow-expression function, so the action
-          # cannot compute this itself and rejects an empty value rather than
-          # deriving a key that would hit forever. The committed Cargo.lock is
-          # the right input: it changes exactly when the dependency graph does,
-          # which is exactly when the registry and build layers must be
-          # re-keyed.
+          # `hashFiles()` is a workflow-expression function the action cannot
+          # call itself, so the value has to come from here. The committed
+          # Cargo.lock is the right input: it changes exactly when the
+          # dependency graph does, which is exactly when the registry and build
+          # layers must be re-keyed.
           cache-key-hash: ${{ hashFiles('Cargo.lock') }}
           # Deliberately NOT `act-cache`, the suffix the harness workflow uses.
           # GitHub's cache is repository-scoped, not workflow-scoped, so a
@@ -88,10 +90,11 @@ jobs:
           echo "cache:              $CACHE_JSON"
 
       # `msrv-check: error` above already fails the job when the resolved graph
-      # needs a NEWER compiler than the one installed. These assertions cover
-      # the other half: that the check read the value from where we think, and
-      # found the number we think. A check silently falling back to a different
-      # source would otherwise pass while testing nothing.
+      # needs a NEWER compiler than the one installed. This step covers the case
+      # that check cannot see: the action finding NOTHING. Every msrv output is
+      # an empty string when there is no rust-version to read, and an empty
+      # output is not an error anywhere in the action -- so it has to be one
+      # here, or the workflow proceeds on values that mean "I found nothing".
       - name: Verify The MSRV Was Read From Cargo.toml
         shell: bash
         env:
@@ -105,21 +108,14 @@ jobs:
           echo "msrv-effective: $MSRV_EFFECTIVE"
           echo "msrv-source:    $MSRV_SOURCE"
 
-          # Read the floor straight out of the manifest rather than comparing
-          # the action's output against itself. grep is the INDEPENDENT source:
-          # the action parsed Cargo.toml its own way, this parses it another,
-          # and the assertion is that the two agree -- which is exactly what
-          # this step is named for. No version literal lives in this workflow,
-          # so raising rust-version needs no edit here.
-          declared="$(grep -m1 -E '^rust-version[[:space:]]*=' Cargo.toml | cut -d'"' -f2)"
-          echo "declared:       $declared"
-
-          if [[ -z "$declared" ]]; then
-            echo "::error::the root Cargo.toml declares no rust-version, so there is no floor to verify"
-            exit 1
-          fi
-          if [[ "$MSRV" != "$declared" ]]; then
-            echo "::error::msrv is '$MSRV' but the root Cargo.toml declares '$declared'"
+          # `msrv` is the empty string when the action found no rust-version,
+          # and `msrv-source` is `none` in the same case. Neither is an error to
+          # the action: channel resolution is
+          # `toolchain ?? rust-toolchain.toml ?? msrv-fallback ?? "stable"`,
+          # so a miss just slides to the next link. Catching the empty output
+          # here is what turns that silent slide into a failed job.
+          if [[ -z "$MSRV" || "$MSRV_SOURCE" == "none" ]]; then
+            echo "::error::the action found no rust-version in Cargo.toml (msrv='$MSRV', msrv-source='$MSRV_SOURCE')"
             exit 1
           fi
           if [[ "$MSRV_SOURCE" != "cargo-toml" ]]; then
@@ -177,12 +173,16 @@ jobs:
   # green, and the first person to find out is a consumer on the floor whose
   # build breaks.
   #
-  # No `needs:`, no inputs, no version literal. The floor is discovered from
-  # Cargo.toml by the action itself, so this job shares no state with the build
-  # above: it still reports when that job fails, and vice versa.
+  # No inputs and no version literal: the floor is discovered from Cargo.toml
+  # by the action itself. `needs` names only the gate, never the build job, so
+  # the two verifications stay independent -- this one still reports when the
+  # build fails, and vice versa. The gate is a different kind of dependency: if
+  # the discovered values are empty, NEITHER job is meaningful.
   msrv:
     name: Verify The Declared MSRV Floor
     runs-on: ubuntu-latest
+    needs: [build]
+    if: ${{ needs.build.outputs.msrv != '' && needs.build.outputs.msrv-source != 'none' }}
 
     steps:
       - name: Checkout
@@ -267,11 +267,21 @@ jobs:
           echo "effective msrv:     $MSRV_EFFECTIVE"
           echo "msrv-source:        $MSRV_SOURCE"
 
-          # An empty msrv means the fallback had nothing to derive from, so the
-          # action would have installed rustup's default instead and everything
-          # below would be measuring the wrong compiler.
-          if [[ -z "$MSRV" ]]; then
-            echo "::error::the action read no rust-version from Cargo.toml, so msrv-fallback had nothing to install"
+          # The guard this job needs most. `msrv` empty and `msrv-source` `none`
+          # both mean the action found no rust-version -- and with the toml
+          # removed above, resolution then falls through to `stable`. The job
+          # would install the NEWEST compiler, `cargo check` would pass, and a
+          # green tick would claim the floor was verified. Reading the action's
+          # own outputs is what turns that into a failure.
+          if [[ -z "$MSRV" || "$MSRV_SOURCE" == "none" ]]; then
+            echo "::error::the action read no rust-version from Cargo.toml (msrv='$MSRV', msrv-source='$MSRV_SOURCE'); msrv-fallback had nothing to install and resolution fell through to 'stable'"
+            exit 1
+          fi
+
+          # msrv-check computes this against the resolved graph; empty means the
+          # check never completed, so `msrv-check: error` above was inert.
+          if [[ -z "$MSRV_EFFECTIVE" ]]; then
+            echo "::error::msrv-effective is empty; the graph check did not run, so nothing verified the dependencies against this floor"
             exit 1
           fi
 
